@@ -3,7 +3,11 @@ import numpy as np
 import random
 import os
 import time
-import json  # Added for saving/loading results
+import json
+
+# Machine Learning components for Clustering
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
 # Fix PyCharm rendering bug by forcing a stable standalone window backend
 import matplotlib
@@ -21,7 +25,7 @@ ALIGNMENT_THRESHOLD = 0.7
 
 SAMPLES_FOLDER = "samples"
 REFERENCE_FILE = os.path.join("reference", "reference.fasta")
-CACHE_FILE = "analysis_cache.json"  # File where analysis metadata is saved
+CACHE_FILE = "analysis_cache.json"
 
 random.seed(42)
 
@@ -139,6 +143,9 @@ def analyze_sample(reads, reference, kmer_index, k):
     gc_contents = []
     read_lengths = []
 
+    # Initialize a base-by-base genomic coverage track array
+    coverage_array = np.zeros(len(reference), dtype=int)
+
     for read in reads:
         seq = read["seq"]
         read_lengths.append(len(seq))
@@ -149,40 +156,44 @@ def analyze_sample(reads, reference, kmer_index, k):
         gc_contents.append((g_count + c_count) / len(seq) * 100 if seq else 0)
 
         rc = reverse_complement(seq)
-        _, score_f = align_read_kmer(seq, reference, kmer_index, k)
-        _, score_r = align_read_kmer(rc, reference, kmer_index, k)
-        score = max(score_f, score_r)
+        best_pos_f, score_f = align_read_kmer(seq, reference, kmer_index, k)
+        best_pos_r, score_r = align_read_kmer(rc, reference, kmer_index, k)
+
+        if score_f >= score_r:
+            best_pos, score = best_pos_f, score_f
+        else:
+            best_pos, score = best_pos_r, score_r
 
         if score >= ALIGNMENT_THRESHOLD:
             aligned_reads += 1
             scores.append(score)
+
+            # Map the footprint layout of this read onto our coverage track
+            for bp_idx in range(best_pos, best_pos + len(seq)):
+                if 0 <= bp_idx < len(reference):
+                    coverage_array[bp_idx] += 1
 
     return {
         "aligned_reads": aligned_reads,
         "total_reads": len(reads),
         "mt_fraction": aligned_reads / len(reads) if reads else 0,
         "mean_score": float(np.mean(scores)) if scores else 0.0,
-        "scores": scores,  # Stored for detailed metrics distribution
-        "gc_contents": gc_contents,  # Stored for quality metric graph
-        "read_lengths": read_lengths  # Stored for quality metric graph
+        "scores": scores,
+        "gc_contents": gc_contents,
+        "read_lengths": read_lengths,
+        "coverage_array": coverage_array.tolist()
     }
 
 
 # =====================================================
-# MULTI-GRAPH GENERATION VISUALIZER
-# =====================================================
-
-# =====================================================
-# INDEPENDENT GRAPH GENERATION VISUALIZER (NEW)
+# INDEPENDENT GRAPH GENERATION VISUALIZER
 # =====================================================
 
 def plot_all_data(plot_data):
-    """Generates four separate independent windows for sequence data metrics."""
+    """Generates separate independent windows for sequence data metrics."""
     sorted_samples = sorted(plot_data.keys())
 
-    # -------------------------------------------------
     # Window 1: Aligned Reads Bar Graph
-    # -------------------------------------------------
     plt.figure(num="1. Aligned Reads Count", figsize=(8, 6))
     aligned_counts = [plot_data[s]['aligned_reads'] for s in sorted_samples]
     bars = plt.bar(sorted_samples, aligned_counts, color='skyblue', edgecolor='black')
@@ -191,16 +202,13 @@ def plot_all_data(plot_data):
     plt.xticks(rotation=30, ha='right')
     plt.grid(axis='y', linestyle='--', alpha=0.5)
 
-    # Add exact numeric values on top of bars
     for bar in bars:
         yval = bar.get_height()
         plt.text(bar.get_x() + bar.get_width() / 2, yval + (max(aligned_counts) * 0.01),
                  f'{int(yval):,}', ha='center', va='bottom', fontsize=9)
     plt.tight_layout()
 
-    # -------------------------------------------------
     # Window 2: GC Content Distribution Histogram
-    # -------------------------------------------------
     plt.figure(num="2. GC Content Distribution", figsize=(8, 6))
     for sample in sorted_samples:
         plt.hist(plot_data[sample]['gc_contents'], bins=20, alpha=0.5, label=sample, histtype='stepfilled')
@@ -211,9 +219,7 @@ def plot_all_data(plot_data):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    # -------------------------------------------------
     # Window 3: Read Length Distribution Histogram
-    # -------------------------------------------------
     plt.figure(num="3. Read Length Distribution", figsize=(8, 6))
     for sample in sorted_samples:
         plt.hist(plot_data[sample]['read_lengths'], bins=15, alpha=0.5, label=sample, histtype='step', linewidth=2)
@@ -224,9 +230,7 @@ def plot_all_data(plot_data):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    # -------------------------------------------------
     # Window 4: Alignment Score Density Distribution
-    # -------------------------------------------------
     plt.figure(num="4. Alignment Score Distribution", figsize=(8, 6))
     for sample in sorted_samples:
         if plot_data[sample]['scores']:
@@ -238,8 +242,83 @@ def plot_all_data(plot_data):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    # Calling plt.show() once at the end opens all 4 active windows at the exact same time
-    plt.show()
+
+# =====================================================
+# 2D SCATTER PLOT K-MEANS CLUSTERING (FIXED)
+# =====================================================
+
+def plot_kmeans_coverage(plot_data):
+    """Clusters and plots each sample as a single point based on raw coverage rates and depth."""
+    sample_names = sorted(plot_data.keys())
+
+    features = []
+    raw_metrics = []  # To retain the unscaled values for plotting on our clear axes
+
+    for sample in sample_names:
+        cov_array = np.array(plot_data[sample]["coverage_array"])
+
+        # 1. Coverage Rate (Breadth): Percentage of total mitochondrial bases mapped
+        coverage_rate = (np.sum(cov_array > 0) / len(cov_array)) * 100
+
+        # 2. Mean Coverage Depth: Average read count across the loop
+        mean_depth = np.mean(cov_array)
+
+        raw_metrics.append((coverage_rate, mean_depth))
+        features.append([coverage_rate, mean_depth])
+
+    X = np.array(features)
+    X_raw = np.array(raw_metrics)
+
+    # Scale feature profiles so clustering math handles depth vs rate variations evenly
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Execute K-Means groupings (k=3)
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X_scaled)
+
+    # Generate Window 5 Scatter Plot
+    plt.figure(num="5. KMeans Coverage Clustering", figsize=(9, 7))
+
+    colors = ['#FF5733', '#2ECC71', '#3498DB']
+    markers = ['o', 's', '^']
+
+    # Plot each cluster cohort
+    for cluster_idx in range(3):
+        indices = np.where(cluster_labels == cluster_idx)[0]
+        plt.scatter(
+            X_raw[indices, 0],  # X = Coverage Rate (%)
+            X_raw[indices, 1],  # Y = Mean Depth
+            c=colors[cluster_idx],
+            marker=markers[cluster_idx],
+            s=140,
+            edgecolor='black',
+            label=f'Cluster {cluster_idx + 1}',
+            alpha=0.9,
+            zorder=3
+        )
+
+    # Draw clean sample names next to each dot
+    for idx, sample in enumerate(sample_names):
+        clean_label = sample.replace('_500k.fastq', '')
+        plt.annotate(
+            clean_label,
+            (X_raw[idx, 0], X_raw[idx, 1]),
+            textcoords="offset points",
+            xytext=(0, 10),
+            ha='center',
+            fontsize=8,
+            fontweight='semibold',
+            zorder=4
+        )
+
+    plt.title("Sample Grouping Matrix via Concrete Coverage Metrics\n(K-Means Clustering)", fontsize=11,
+              fontweight='bold', pad=15)
+    plt.xlabel("Coverage Breadth (% of Mitochondrial Genome Covered)", fontweight='bold')
+    plt.ylabel("Mean Coverage Depth (Average Reads per Base Position)", fontweight='bold')
+    plt.legend(loc='best', frameon=True, shadow=True)
+    plt.grid(True, linestyle=':', alpha=0.6, zorder=1)
+    plt.tight_layout()
 
 
 # =====================================================
@@ -250,20 +329,26 @@ def main():
     plot_data = {}
     use_cache = False
 
-    # Check if a cache file already exists to skip calculation steps
     if os.path.exists(CACHE_FILE):
-        print("=" * 60)
-        print("FOUND PREVIOUSLY SAVED ANALYSIS RUN DATA!")
-        print("=" * 60)
-        choice = input("Would you like to load cache and display graphs instantly? (y/n): ").strip().lower()
-        if choice in ['y', 'yes']:
-            use_cache = True
+        try:
+            with open(CACHE_FILE, "r") as f:
+                temp_data = json.load(f)
 
-    if use_cache:
-        print("\nLoading cached results from disk...")
-        with open(CACHE_FILE, "r") as f:
-            plot_data = json.load(f)
-    else:
+            first_entry = next(iter(temp_data.values()))
+            if "coverage_array" in first_entry:
+                print("=" * 60)
+                print("FOUND VALID PREVIOUSLY SAVED RUN DATA WITH COVERAGE ARRAYS!")
+                print("=" * 60)
+                choice = input("Load database cache and view updated graphs instantly? (y/n): ").strip().lower()
+                if choice in ['y', 'yes']:
+                    plot_data = temp_data
+                    use_cache = True
+            else:
+                print("\n[Notice] Old cache file detected without genomic coverage metrics. Overwriting database...")
+        except Exception:
+            print("\n[Notice] Error checking cache file. Re-running full sequence alignment...")
+
+    if not use_cache:
         print("\nRunning full sequence alignment processing...")
         print("Loading reference...")
         reference = load_reference(REFERENCE_FILE)
@@ -294,18 +379,17 @@ def main():
 
             plot_data[sample] = result
 
-        # Save results to a structured JSON database cache file
-        print(f"\nSaving results to database file: '{CACHE_FILE}'...")
+        print(f"\nSaving detailed genomic profiling results to database file: '{CACHE_FILE}'...")
         with open(CACHE_FILE, "w") as f:
             json.dump(plot_data, f)
 
     print("\nGenerating dashboard windows visualization...")
     plot_all_data(plot_data)
+    plot_kmeans_coverage(plot_data)
+
+    plt.show()
     print("\nProcess finalized successfully.")
 
 
-# =====================================================
-# ENTRY POINT
-# =====================================================
 if __name__ == "__main__":
     main()
