@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 # =====================================================
 
 MAX_READS = 500000
-K = 5
+K = 10
 ALIGNMENT_THRESHOLD = 0.7
 MAX_EDIT_DISTANCE = 2
 
@@ -67,13 +67,13 @@ def prompt_filter_mode():
 # REFERENCE LOADING
 # =====================================================
 
-def load_reference(path):
+def load_reference(path, circular_wrap=500):
     seq = ""
     with open(path, "r") as f:
         for line in f:
             if not line.startswith(">"):
                 seq += line.strip()
-    return seq
+    return seq + seq[:circular_wrap]
 
 
 # =====================================================
@@ -82,7 +82,7 @@ def load_reference(path):
 
 def build_kmer_index(reference, k):
     index = defaultdict(list)
-    for i in range(len(reference) - k):
+    for i in range(len(reference) - k +1):
         kmer = reference[i:i + k]
         index[kmer].append(i)
     return index
